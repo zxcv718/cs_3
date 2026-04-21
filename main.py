@@ -10,7 +10,8 @@ Mini NPU Simulator
 2. data.json 파일을 읽어서 여러 테스트 케이스를 자동 분석하는 모드
 
 핵심 개념은 MAC(Multiply-Accumulate) 연산이다.
-같은 위치의 값끼리 곱한 뒤 전부 더해서, 입력 패턴이 어떤 필터와 더 비슷한지 점수로 판단한다.
+같은 위치의 값끼리 곱한 뒤 전부 더해 MAC 점수를 만들고,
+그 점수가 각 필터의 "활성 칸 수" 기준 목표값과 얼마나 가까운지 거리로 바꿔 최종 판정한다.
 
 이 파일은 "동작" 자체보다 "읽고 이해하기 쉬운 구조"도 중요하게 생각해서 작성되어 있다.
 그래서 함수 역할을 잘게 나누고, JSON 검증/라벨 정규화/판정/성능 측정을 각각 분리해 두었다.
@@ -29,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # 예를 들어 3x3 패턴이라면 [[0.0, 1.0, 0.0], [1.0, 1.0, 1.0], [0.0, 1.0, 0.0]] 같은 형태다.
 Matrix = List[List[float]]
 
-# 두 점수를 비교할 때 사용할 허용 오차다.
+# 두 거리 값을 비교할 때 사용할 허용 오차다.
 # 부동소수점은 사람이 기대하는 값과 아주 조금 다르게 저장될 수 있어서,
 # 완전히 같지 않더라도 차이가 매우 작으면 "동점"으로 보는 정책이 필요하다.
 EPSILON = 1e-9
@@ -63,6 +64,8 @@ class CaseResult:
 
     score_cross / score_x:
         각 필터와의 MAC 점수. 계산 자체가 불가능한 경우(None)일 수 있다.
+    distance_cross / distance_x:
+        각 필터의 "목표 점수와의 거리". 계산 자체가 불가능한 경우(None)일 수 있다.
     predicted:
         프로그램이 최종적으로 내린 판정값(Cross, X, UNDECIDED, N/A)
     expected:
@@ -76,6 +79,8 @@ class CaseResult:
     id: str
     score_cross: Optional[float]
     score_x: Optional[float]
+    distance_cross: Optional[float]
+    distance_x: Optional[float]
     predicted: str
     expected: Optional[str]
     status: str
@@ -147,6 +152,13 @@ def format_score(value: Optional[float]) -> str:
     return repr(value)
 
 
+def format_distance(value: Optional[float]) -> str:
+    """거리 출력용 포맷 함수. 계산할 수 없으면 N/A를 출력한다."""
+    if value is None:
+        return "N/A"
+    return repr(value)
+
+
 def format_ms(value: Optional[float]) -> str:
     """밀리초(ms) 값을 소수점 6자리까지 맞춰 문자열로 바꾼다."""
     if value is None:
@@ -182,7 +194,7 @@ def is_finite_number(value: float) -> bool:
     """
     NaN, Infinity 같은 비정상 실수를 걸러내기 위한 보조 함수다.
 
-    MAC 점수 비교는 "유한한 실수"를 전제로 해야 의미가 있으므로,
+    거리 기반 판정은 "유한한 실수"를 전제로 해야 의미가 있으므로,
     입력 단계에서 이런 값을 미리 막아 두는 편이 안전하다.
     """
     return math.isfinite(value)
@@ -313,18 +325,54 @@ def compute_mac(pattern: Matrix, filter_matrix: Matrix) -> float:
     return total
 
 
-def classify_scores(score_cross: float, score_x: float, epsilon: float = EPSILON) -> str:
+def compute_filter_sum(filter_matrix: Matrix) -> float:
     """
-    Cross 점수와 X 점수를 비교해서 최종 라벨을 정한다.
+    필터가 기대하는 "판정용 목표 점수"를 계산한다.
+
+    여기서의 목표 점수는 "필터 원소의 raw 합"이 아니다.
+    필터에서 0이 아닌 칸이 몇 개인지를 세어,
+    해당 모양이 정상적인 0/1 패턴으로 정확히 채워졌을 때의 기준값으로 사용한다.
+
+    예:
+    - [[1, 0, 1], [0, 1, 0], [1, 0, 1]] -> 5
+    - [[100, 0, 100], [0, 100, 0], [100, 0, 100]] -> 5
+
+    이렇게 해야 값의 크기가 과도하게 커진 필터가
+    거리 0으로 오판정되는 문제를 막을 수 있다.
+    """
+    total = 0.0
+    for row in filter_matrix:
+        for value in row:
+            if value != 0.0:
+                total += 1.0
+    return total
+
+
+def compute_distance(score: float, filter_sum: float) -> float:
+    """
+    MAC 점수가 해당 필터의 목표 점수에서 얼마나 떨어져 있는지 계산한다.
+
+    거리가 0에 가까울수록 그 필터와 더 잘 맞는다고 해석한다.
+    """
+    return abs(score - filter_sum)
+
+
+def classify_distances(
+    distance_cross: float,
+    distance_x: float,
+    epsilon: float = EPSILON,
+) -> str:
+    """
+    Cross 거리와 X 거리를 비교해서 최종 라벨을 정한다.
 
     규칙:
-    - 두 점수 차이가 epsilon보다 작으면 UNDECIDED
-    - Cross가 더 크면 Cross
-    - X가 더 크면 X
+    - 두 거리 차이가 epsilon보다 작으면 UNDECIDED
+    - Cross 거리가 더 작으면 Cross
+    - X 거리가 더 작으면 X
     """
-    if abs(score_cross - score_x) < epsilon:
+    if abs(distance_cross - distance_x) < epsilon:
         return "UNDECIDED"
-    if score_cross > score_x:
+    if distance_cross < distance_x:
         return "Cross"
     return "X"
 
@@ -501,6 +549,8 @@ def build_failure_result(
         id=case_id,
         score_cross=None,
         score_x=None,
+        distance_cross=None,
+        distance_x=None,
         predicted="N/A",
         expected=expected,
         status="FAIL",
@@ -573,8 +623,9 @@ def evaluate_case(
     1. 같은 크기의 Cross/X 필터를 찾는다.
     2. 둘 중 하나라도 없으면 FAIL 처리한다.
     3. 두 MAC 점수를 계산한다.
-    4. 점수를 비교해 Cross/X/UNDECIDED를 판정한다.
-    5. expected와 비교해 PASS/FAIL을 결정한다.
+    4. 각 필터의 목표 점수까지의 거리를 계산한다.
+    5. 거리를 비교해 Cross/X/UNDECIDED를 판정한다.
+    6. expected와 비교해 PASS/FAIL을 결정한다.
     """
     size_filters = filters_by_size.get(case.size, {})
     cross_filter = size_filters.get("Cross")
@@ -603,7 +654,11 @@ def evaluate_case(
     # 같은 패턴을 두 필터와 각각 비교해서 점수를 계산한다.
     score_cross = compute_mac(case.pattern, cross_filter)
     score_x = compute_mac(case.pattern, x_filter)
-    predicted = classify_scores(score_cross, score_x)
+    filter_sum_cross = compute_filter_sum(cross_filter)
+    filter_sum_x = compute_filter_sum(x_filter)
+    distance_cross = compute_distance(score_cross, filter_sum_cross)
+    distance_x = compute_distance(score_x, filter_sum_x)
+    predicted = classify_distances(distance_cross, distance_x)
 
     # predicted는 프로그램의 판정,
     # expected_label은 데이터셋이 기대한 정답이다.
@@ -612,7 +667,7 @@ def evaluate_case(
         reason = "matched_expected"
     elif predicted == "UNDECIDED":
         status = "FAIL"
-        reason = f"undecided_by_epsilon: |Cross-X| < {EPSILON}"
+        reason = f"undecided_by_epsilon: |distance_cross-distance_x| < {EPSILON}"
     else:
         status = "FAIL"
         reason = (
@@ -624,6 +679,8 @@ def evaluate_case(
         id=case.id,
         score_cross=score_cross,
         score_x=score_x,
+        distance_cross=distance_cross,
+        distance_x=distance_x,
         predicted=predicted,
         expected=case.expected_label,
         status=status,
@@ -636,6 +693,8 @@ def print_case_result(result: CaseResult) -> None:
     print(f"--- {result.id} ---")
     print(f"Cross 점수: {format_score(result.score_cross)}")
     print(f"X 점수: {format_score(result.score_x)}")
+    print(f"Cross 거리: {format_distance(result.distance_cross)}")
+    print(f"X 거리: {format_distance(result.distance_x)}")
     expected = result.expected if result.expected is not None else "N/A"
     print(f"판정: {result.predicted} | expected: {expected} | {result.status}")
     if result.status == "FAIL":
@@ -726,16 +785,20 @@ def run_user_input_mode() -> None:
     print_section(4, "MAC 결과")
     score_a = compute_mac(pattern, filter_a)
     score_b = compute_mac(pattern, filter_b)
+    distance_a = compute_distance(score_a, compute_filter_sum(filter_a))
+    distance_b = compute_distance(score_b, compute_filter_sum(filter_b))
     performance_row = build_mode1_performance(pattern, filter_a)[0]
 
     print(f"A 점수: {format_score(score_a)}")
     print(f"B 점수: {format_score(score_b)}")
+    print(f"A 거리: {format_distance(distance_a)}")
+    print(f"B 거리: {format_distance(distance_b)}")
     print(f"연산 시간(평균/{BENCHMARK_REPEATS}회): {format_ms(performance_row.average_ms)} ms")
 
-    # 모드 1은 요구사항에 맞춰 A / B / 판정 불가 형태로 보여준다.
-    if abs(score_a - score_b) < EPSILON:
-        print(f"판정: 판정 불가 (|A-B| < {EPSILON})")
-    elif score_a > score_b:
+    # 모드 1은 거리 기준으로 A / B / 판정 불가 형태를 보여준다.
+    if abs(distance_a - distance_b) < EPSILON:
+        print(f"판정: 판정 불가 (|A거리-B거리| < {EPSILON})")
+    elif distance_a < distance_b:
         print("판정: A")
     else:
         print("판정: B")
