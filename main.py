@@ -11,7 +11,7 @@ Mini NPU Simulator
 
 핵심 개념은 MAC(Multiply-Accumulate) 연산이다.
 같은 위치의 값끼리 곱한 뒤 전부 더해 MAC 점수를 만들고,
-그 점수가 각 필터의 "활성 칸 수" 기준 목표값과 얼마나 가까운지 거리로 바꿔 최종 판정한다.
+그 점수가 입력 패턴의 총합과 얼마나 가까운지 절대오차로 바꿔 최종 판정한다.
 
 이 파일은 "동작" 자체보다 "읽고 이해하기 쉬운 구조"도 중요하게 생각해서 작성되어 있다.
 그래서 함수 역할을 잘게 나누고, JSON 검증/라벨 정규화/판정/성능 측정을 각각 분리해 두었다.
@@ -65,7 +65,8 @@ class CaseResult:
     score_cross / score_x:
         각 필터와의 MAC 점수. 계산 자체가 불가능한 경우(None)일 수 있다.
     distance_cross / distance_x:
-        각 필터의 "목표 점수와의 거리". 계산 자체가 불가능한 경우(None)일 수 있다.
+        각 필터의 MAC 결과가 입력 패턴 총합에서 얼마나 벗어났는지 나타내는 절대오차.
+        계산 자체가 불가능한 경우(None)일 수 있다.
     predicted:
         프로그램이 최종적으로 내린 판정값(Cross, X, UNDECIDED, N/A)
     expected:
@@ -325,36 +326,33 @@ def compute_mac(pattern: Matrix, filter_matrix: Matrix) -> float:
     return total
 
 
-def compute_filter_sum(filter_matrix: Matrix) -> float:
+def compute_pattern_sum(pattern: Matrix) -> float:
     """
-    필터가 기대하는 "판정용 목표 점수"를 계산한다.
+    입력 패턴의 총합을 계산한다.
 
-    여기서의 목표 점수는 "필터 원소의 raw 합"이 아니다.
-    필터에서 0이 아닌 칸이 몇 개인지를 세어,
-    해당 모양이 정상적인 0/1 패턴으로 정확히 채워졌을 때의 기준값으로 사용한다.
+    현재 판정 정책은 "필터의 기준점수"를 따로 두지 않고,
+    MAC 결과가 입력 패턴 총합에 얼마나 가까운지를 본다.
+    즉 같은 패턴 하나를 두 필터와 각각 비교한 뒤,
+    두 결과가 "패턴이 가진 전체 값"을 얼마나 잘 설명하는지 비교한다.
 
     예:
-    - [[1, 0, 1], [0, 1, 0], [1, 0, 1]] -> 5
-    - [[100, 0, 100], [0, 100, 0], [100, 0, 100]] -> 5
-
-    이렇게 해야 값의 크기가 과도하게 커진 필터가
-    거리 0으로 오판정되는 문제를 막을 수 있다.
+    - pattern 합이 5이고 MAC 결과가 5면 오차는 0
+    - pattern 합이 5이고 MAC 결과가 50이면 오차는 45
     """
     total = 0.0
-    for row in filter_matrix:
+    for row in pattern:
         for value in row:
-            if value != 0.0:
-                total += 1.0
+            total += value
     return total
 
 
-def compute_distance(score: float, filter_sum: float) -> float:
+def compute_distance(score: float, pattern_sum: float) -> float:
     """
-    MAC 점수가 해당 필터의 목표 점수에서 얼마나 떨어져 있는지 계산한다.
+    MAC 점수가 입력 패턴 총합에서 얼마나 떨어져 있는지 계산한다.
 
-    거리가 0에 가까울수록 그 필터와 더 잘 맞는다고 해석한다.
+    절대오차가 0에 가까울수록 그 필터가 패턴과 더 잘 맞는다고 해석한다.
     """
-    return abs(score - filter_sum)
+    return abs(score - pattern_sum)
 
 
 def classify_distances(
@@ -623,8 +621,8 @@ def evaluate_case(
     1. 같은 크기의 Cross/X 필터를 찾는다.
     2. 둘 중 하나라도 없으면 FAIL 처리한다.
     3. 두 MAC 점수를 계산한다.
-    4. 각 필터의 목표 점수까지의 거리를 계산한다.
-    5. 거리를 비교해 Cross/X/UNDECIDED를 판정한다.
+    4. 입력 패턴 총합을 기준으로 각 필터의 절대오차를 계산한다.
+    5. 절대오차를 비교해 Cross/X/UNDECIDED를 판정한다.
     6. expected와 비교해 PASS/FAIL을 결정한다.
     """
     size_filters = filters_by_size.get(case.size, {})
@@ -654,10 +652,9 @@ def evaluate_case(
     # 같은 패턴을 두 필터와 각각 비교해서 점수를 계산한다.
     score_cross = compute_mac(case.pattern, cross_filter)
     score_x = compute_mac(case.pattern, x_filter)
-    filter_sum_cross = compute_filter_sum(cross_filter)
-    filter_sum_x = compute_filter_sum(x_filter)
-    distance_cross = compute_distance(score_cross, filter_sum_cross)
-    distance_x = compute_distance(score_x, filter_sum_x)
+    pattern_sum = compute_pattern_sum(case.pattern)
+    distance_cross = compute_distance(score_cross, pattern_sum)
+    distance_x = compute_distance(score_x, pattern_sum)
     predicted = classify_distances(distance_cross, distance_x)
 
     # predicted는 프로그램의 판정,
@@ -785,8 +782,9 @@ def run_user_input_mode() -> None:
     print_section(4, "MAC 결과")
     score_a = compute_mac(pattern, filter_a)
     score_b = compute_mac(pattern, filter_b)
-    distance_a = compute_distance(score_a, compute_filter_sum(filter_a))
-    distance_b = compute_distance(score_b, compute_filter_sum(filter_b))
+    pattern_sum = compute_pattern_sum(pattern)
+    distance_a = compute_distance(score_a, pattern_sum)
+    distance_b = compute_distance(score_b, pattern_sum)
     performance_row = build_mode1_performance(pattern, filter_a)[0]
 
     print(f"A 점수: {format_score(score_a)}")
